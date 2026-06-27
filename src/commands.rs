@@ -78,6 +78,7 @@ pub fn run_scan(with_ocr: bool, min_dur: f64) {
 
     println!("Found {} video files", video_files.len());
 
+    // Process each file — probe duration + hash + optional OCR
     let pb = ProgressBar::new(video_files.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -91,6 +92,7 @@ pub fn run_scan(with_ocr: bool, min_dur: f64) {
         pb.set_message(vf.path.clone());
         pb.inc(1);
 
+        // Check cache first
         if let Some(cached) = cache.get(&vf.path) {
             if !VideoFileCache::is_stale(&vf.path, cached) {
                 processed.push(VideoFile {
@@ -107,26 +109,32 @@ pub fn run_scan(with_ocr: bool, min_dur: f64) {
             }
         }
 
+        // Cache miss — compute metadata
         let mut processed_vf = VideoFile::new(vf.path.clone());
         processed_vf.mod_time = vf.mod_time;
 
+        // Probe duration via ffprobe
         if let Some(dur) = probe_duration(&vf.path) {
             processed_vf.duration = dur;
         }
 
+        // OCR: extract a frame via ffmpeg, then run OCR on it
         if with_ocr {
-            match ocr::extract_text_from_image(&vf.path) {
+            let ocr_results = extract_ocr_from_video(&vf.path);
+            match ocr_results {
                 Ok(results) => processed_vf.ocr_results = results,
                 Err(e) => eprintln!("  OCR warning: {}", e),
             }
         }
 
+        // Add to cache
         cache.set(vf.path.clone(), (&processed_vf).into());
         processed.push(processed_vf);
     }
 
     pb.finish_and_clear();
 
+    // Filter by minimum duration
     let filtered: Vec<VideoFile> = if cfg.min_duration_secs > 0.0 {
         processed
             .into_iter()
@@ -169,10 +177,64 @@ fn probe_duration(path: &str) -> Option<f64> {
     }
 }
 
+/// Extract a frame from a video using ffmpeg and run OCR on it
+fn extract_ocr_from_video(path: &str) -> Result<Vec<crate::video::OcrResult>, String> {
+    // Create a temp file for the extracted frame
+    let tmp_dir = std::env::temp_dir();
+    let frame_path = tmp_dir.join("rpick_ocr_frame.jpg");
+
+    // Use ffmpeg to extract a frame at 1 second (or first frame if shorter)
+    let output = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",                     // overwrite output
+            "-i",
+            path,
+            "-vf",
+            "select='eq(pict_type,PICT_TYPE_I)'", // try keyframe
+            "-frames:v",
+            "1",
+            &frame_path.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+
+    if !output.status.success() {
+        // Fallback: try extracting first frame without keyframe selection
+        let output2 = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                path,
+                "-frames:v",
+                "1",
+                &frame_path.to_string_lossy(),
+            ])
+            .output()
+            .map_err(|e| format!("Failed to run ffmpeg (fallback): {}", e))?;
+
+        if !output2.status.success() {
+            return Err("ffmpeg could not extract a frame".to_string());
+        }
+    }
+
+    // Now run OCR on the extracted frame
+    let results = ocr::extract_text_from_image(&frame_path.to_string_lossy())?;
+
+    // Clean up temp file
+    std::fs::remove_file(&frame_path).ok();
+
+    Ok(results)
+}
+
 /// ── Find OCR ─────────────────────────────────────────────────────
 
 pub fn run_find_ocr(query: &str, trash: bool, play: bool) {
     let cache = load_cache();
+    let _cfg = Config::default();
 
     println!("Searching OCR cache for: '{}'", query);
 

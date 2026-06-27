@@ -1,9 +1,8 @@
-//! rpick — Video file manager and organizer
+//! rpick — Video file manager and organizer (Rust port of gopick)
 //!
-//! Rust port of gopick (Go video sorting/flagging utility).
-//! Provides CLI commands for scanning, OCR, duplicates, and file management.
+//! CLI flags match gopick's original flag-based interface.
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
 use rpick::commands;
 
@@ -11,89 +10,92 @@ use rpick::commands;
 #[command(name = "rpick")]
 #[command(about = "Video file manager and organizer")]
 struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
+    /// Scan and populate cache only, no UI
+    #[arg(short = 's', long)]
+    scan: bool,
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Normal interactive mode (video file manager with playback)
-    #[command(name = "normal")]
-    Normal {
-        /// Minimum video duration in minutes (default: no filter)
-        #[arg(long, default_value = "0")]
-        min_dur: f64,
-    },
+    /// Scan with OCR text detection (slower)
+    #[arg(long)]
+    scan_ocr: bool,
 
-    /// Scan video files (with optional OCR)
-    #[command(name = "scan")]
-    Scan {
-        /// Perform OCR text detection on each file
-        #[arg(long)]
-        ocr: bool,
+    /// Search cached OCR results for text
+    #[arg(long)]
+    find_ocr: Option<String>,
 
-        /// Minimum video duration in minutes
-        #[arg(long, default_value = "0")]
-        min_dur: f64,
-    },
+    /// Move -find-ocr matches to trash (requires -find-ocr)
+    #[arg(long)]
+    trash: bool,
 
-    /// Find files matching OCR text in cache
-    #[command(name = "find-ocr")]
-    FindOcr {
-        /// Query string to search for
-        #[arg(long)]
-        query: String,
+    /// Play the videos found with -find-ocr
+    #[arg(long)]
+    play: bool,
 
-        /// Trash matching files
-        #[arg(long)]
-        trash: bool,
+    /// Move all but one of each dupe to ../Dupes
+    #[arg(long)]
+    dupes: bool,
 
-        /// Play matching files
-        #[arg(long)]
-        play: bool,
-    },
+    /// Fix special characters in filenames (standalone mode)
+    #[arg(long)]
+    fix_special: bool,
 
-    /// Find and move duplicate files
-    #[command(name = "dupes")]
-    Dupes,
-
-    /// Fix special characters in filenames
-    #[command(name = "fix-special")]
-    FixSpecial,
-
-    /// Add duration prefix to filenames
-    #[command(name = "add-dur")]
-    AddDur,
+    /// Add duration to video filenames
+    #[arg(long)]
+    add_dur: bool,
 
     /// Fix incorrect duration prefixes in filenames
-    #[command(name = "fix-dur")]
-    FixDur,
+    #[arg(long)]
+    fix_dur: bool,
+
+    /// Minimum duration in minutes to include videos
+    #[arg(short = 'd', long = "min-dur", default_value = "0")]
+    min_dur: f64,
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    match &cli.command {
-        Commands::Normal { min_dur } => {
-            commands::run_normal(*min_dur);
+    // Validate flag combinations
+    if cli.fix_special {
+        if cli.scan || cli.scan_ocr || cli.find_ocr.is_some() || cli.trash || cli.add_dur || cli.fix_dur {
+            eprintln!("Error: -fix-special must be used alone (no other flags)");
+            return;
         }
-        Commands::Scan { ocr, min_dur } => {
-            commands::run_scan(*ocr, *min_dur);
+        commands::run_fix_special();
+        return;
+    }
+
+    if cli.add_dur {
+        if cli.scan || cli.scan_ocr || cli.find_ocr.is_some() || cli.trash || cli.fix_special || cli.fix_dur {
+            eprintln!("Error: -add-dur must be used alone (no other flags)");
+            return;
         }
-        Commands::FindOcr { query, trash, play } => {
-            commands::run_find_ocr(query, *trash, *play);
+        commands::run_add_dur();
+        return;
+    }
+
+    if cli.fix_dur {
+        if cli.scan || cli.scan_ocr || cli.find_ocr.is_some() || cli.trash || cli.fix_special || cli.add_dur {
+            eprintln!("Error: -fix-dur must be used alone (no other flags)");
+            return;
         }
-        Commands::Dupes => {
-            commands::run_dupes();
-        }
-        Commands::FixSpecial => {
-            commands::run_fix_special();
-        }
-        Commands::AddDur => {
-            commands::run_add_dur();
-        }
-        Commands::FixDur => {
-            commands::run_fix_dur();
-        }
+        commands::run_fix_dur();
+        return;
+    }
+
+    if cli.trash && cli.find_ocr.is_none() {
+        eprintln!("Error: -trash flag can only be used with -find-ocr");
+        return;
+    }
+
+    // Dispatch modes
+    if cli.scan || cli.scan_ocr {
+        commands::run_scan(cli.scan_ocr, cli.min_dur);
+    } else if let Some(query) = cli.find_ocr {
+        commands::run_find_ocr(&query, cli.trash, cli.play);
+    } else if cli.dupes {
+        commands::run_dupes();
+    } else {
+        // Default: interactive playback mode
+        commands::run_normal(cli.min_dur);
     }
 }
