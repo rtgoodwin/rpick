@@ -92,24 +92,38 @@ pub fn run_scan(with_ocr: bool, min_dur: f64) {
         pb.set_message(vf.path.clone());
         pb.inc(1);
 
-        // Check cache first
-        if let Some(cached) = cache.get(&vf.path) {
-            if !VideoFileCache::is_stale(&vf.path, cached) {
-                processed.push(VideoFile {
-                    path: vf.path.clone(),
-                    duration: cached.duration,
-                    hash: cached.hash,
-                    mod_time: vf.mod_time,
-                    state: VideoFileState::Active,
-                    orig_path: None,
-                    dest_path: None,
-                    ocr_results: cached.ocr_results.clone(),
-                });
-                continue;
+        // Decide whether cache can be used:
+        // - If file is stale → must re-process
+        // - If OCR was requested but cache has no OCR results → must re-process
+        let use_cache = match cache.get(&vf.path) {
+            Some(cached) => {
+                if VideoFileCache::is_stale(&vf.path, cached) {
+                    false
+                } else if with_ocr && cached.ocr_results.is_empty() {
+                    false
+                } else {
+                    true
+                }
             }
+            None => false,
+        };
+
+        if use_cache {
+            let cached = cache.get(&vf.path).unwrap();
+            processed.push(VideoFile {
+                path: vf.path.clone(),
+                duration: cached.duration,
+                hash: cached.hash,
+                mod_time: vf.mod_time,
+                state: VideoFileState::Active,
+                orig_path: None,
+                dest_path: None,
+                ocr_results: cached.ocr_results.clone(),
+            });
+            continue;
         }
 
-        // Cache miss — compute metadata
+        // Cache miss or re-process needed — compute metadata
         let mut processed_vf = VideoFile::new(vf.path.clone());
         processed_vf.mod_time = vf.mod_time;
 
@@ -127,7 +141,7 @@ pub fn run_scan(with_ocr: bool, min_dur: f64) {
             }
         }
 
-        // Add to cache
+        // Add/replace in cache
         cache.set(vf.path.clone(), (&processed_vf).into());
         processed.push(processed_vf);
     }
