@@ -475,24 +475,38 @@ pub fn run_fix_dur() {
 
 /// ── Normal (Playback) ────────────────────────────────────────────
 
+use opencv::core::{Mat, MatTraitConst, Scalar, Point, Rect};
+use opencv::highgui::{self, WINDOW_NORMAL};
+use opencv::videoio::{VideoCapture, CAP_PROP_FPS, CAP_PROP_FRAME_COUNT, CAP_PROP_POS_MSEC};
+use opencv::imgproc::{self, FONT_HERSHEY_SIMPLEX};
+use opencv::prelude::{VideoCaptureTraitConst, VideoCaptureTrait};
+use std::process::Command;
+
+const KEY_Q: i32 = 'q' as i32;
+const KEY_N: i32 = 'n' as i32;
+const KEY_A: i32 = 'a' as i32;
+const KEY_G: i32 = 'g' as i32;
+const KEY_F: i32 = 'f' as i32;
+const KEY_D: i32 = 'd' as i32;
+const KEY_O: i32 = 'o' as i32;
+const KEY_T: i32 = 't' as i32;
+const KEY_W: i32 = 'w' as i32;
+const KEY_U: i32 = 'u' as i32;
+const KEY_Z: i32 = 'z' as i32;
+const KEY_QMARK: i32 = '?' as i32;
+const KEY_ESCAPE: i32 = 27;
+const KEY_SPACE: i32 = 32;
+const KEY_LEFT1: i32 = 81;
+const KEY_LEFT2: i32 = 2424832;
+const KEY_RIGHT1: i32 = 83;
+const KEY_RIGHT2: i32 = 2555904;
+const KEY_UP1: i32 = 82;
+const KEY_UP2: i32 = 2490368;
+const KEY_DOWN1: i32 = 84;
+const KEY_DOWN2: i32 = 2621440;
+
 pub fn run_normal(min_dur: f64) {
     println!("rpick interactive mode — video file manager");
-    println!();
-    println!("Keyboard shortcuts:");
-    println!("  g  Mark as Good (move to ../Good)");
-    println!("  f  Mark as Fine (move to ../Fine)");
-    println!("  d  Move to trash");
-    println!("  u/z Undo last action");
-    println!("  n  Next video");
-    println!("  q  Quit");
-    println!("  Space  Play/Pause");
-    println!("  ←/→   Seek -30s/+30s");
-    println!("  ↑/↓   Next/Previous");
-    println!("  t  OCR text detection");
-    println!("  w  Add Purple tag");
-    println!("  o  Open in Finder");
-    println!("  ?  Help overlay");
-    println!();
 
     let video_files = match filesystem::scan_videos(".") {
         Ok(f) => f,
@@ -547,15 +561,317 @@ pub fn run_normal(min_dur: f64) {
         }
     );
 
-    // TODO: actual video playback with OpenCV
-    println!("\nVideo list:");
-    for vf in &filtered {
-        let total_secs = vf.duration as u64;
-        let mins = total_secs / 60;
-        let secs = total_secs % 60;
-        println!("  [{:02}:{:02}] {}", mins, secs, vf.path);
+    // Load deleted hashes
+    let mut deleted_hashes = load_deleted_hashes();
+
+    // Create window
+    let window_name = "rpick";
+    if let Err(e) = highgui::named_window(window_name, WINDOW_NORMAL) {
+        eprintln!("Failed to create window: {}", e);
+        return;
     }
 
-    println!("\nInteractive playback requires OpenCV integration (see TODO).");
-    println!("Non-interactive modes (scan, dupes, fix-special, etc.) work now.");
+    let mut i = 0usize;
+    let mut paused = false;
+
+    while i < filtered.len() {
+        let vf = &filtered[i];
+        println!("Playing ({}/{}) {}", i + 1, filtered.len(), vf.path);
+
+        // Open video file
+        let mut cap = match VideoCapture::from_file_def(vf.path.as_str()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  Error opening: {}", e);
+                i += 1;
+                continue;
+            }
+        };
+
+        let fps = cap.get(CAP_PROP_FPS).unwrap_or(30.0);
+        let frame_count = cap.get(CAP_PROP_FRAME_COUNT).unwrap_or(0.0);
+        let duration_secs = if fps > 0.0 { frame_count / fps } else { vf.duration };
+
+        let mut frame = Mat::default();
+        let mut help_visible = false;
+        let mut seek_target: Option<f64> = None;
+        let mut current_pos: f64 = 0.0;
+
+        // Main playback loop
+        loop {
+            // Handle pending seek
+            if let Some(target) = seek_target.take() {
+                let ms = (target * 1000.0) as f64;
+                let _ = cap.set(CAP_PROP_POS_MSEC, ms);
+            }
+
+            if !paused {
+                match cap.read(&mut frame) {
+                    Ok(true) => {}
+                    _ => { break; }
+                }
+                // Track current position from the frame
+                current_pos = cap.get(CAP_PROP_POS_MSEC).unwrap_or(0.0) / 1000.0;
+            }
+
+            if frame.empty() {
+                // No frame available yet
+                let key = highgui::wait_key(15).unwrap_or(-1);
+                if key != -1 {
+                    let brk = handle_key(key, vf, &mut i, &mut paused, &mut help_visible, duration_secs, &mut seek_target, &mut current_pos, filtered.len(), &mut deleted_hashes);
+                    if brk {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // Draw overlays (pass mutable frame) with current position
+            let current_mins = (current_pos / 60.0) as i32;
+            let current_secs = (current_pos % 60.0) as i32;
+            draw_ui_overlays(&mut frame, vf, i, filtered.len(), duration_secs, fps, current_mins, current_secs, help_visible);
+
+            // Show frame
+            let _ = highgui::imshow(window_name, &frame);
+
+            // Wait for key (1ms delay between frames for ~1000fps loop)
+            let key = highgui::wait_key(1).unwrap_or(-1);
+
+            // If help is visible, any key dismisses except '?'
+            if help_visible && key != KEY_QMARK && key != -1 {
+                help_visible = false;
+                continue;
+            }
+
+            let brk = handle_key(key, vf, &mut i, &mut paused, &mut help_visible, duration_secs, &mut seek_target, &mut current_pos, filtered.len(), &mut deleted_hashes);
+            if brk {
+                break;
+            }
+        }
+
+        let _ = cap.release();
+        i += 1;
+    }
+
+    let _ = highgui::destroy_all_windows();
+    save_deleted_hashes(&deleted_hashes);
+    println!("Done.");
+}
+
+/// Returns true if the caller should break out of the current video loop (next/quit)
+fn handle_key(key: i32, vf: &VideoFile, i: &mut usize, paused: &mut bool, help_visible: &mut bool, duration_secs: f64, seek_target: &mut Option<f64>, current_pos: &mut f64, _total: usize, deleted_hashes: &mut DeletedHashes) -> bool {
+    if key == -1 {
+        return false;
+    }
+
+    match key {
+        KEY_Q | KEY_ESCAPE => { // q or Escape
+            println!("Quit");
+            return true;
+        }
+        KEY_N | KEY_A => { // n or a -> next
+            return true;
+        }
+        KEY_G => {
+            move_file(vf, "../Good");
+            return true;
+        }
+        KEY_F => {
+            move_file(vf, "../Fine");
+            return true;
+        }
+        KEY_D => {
+            match filesystem::send_to_trash(&vf.path) {
+                Ok(_) => {
+                    println!("  Trashed: {}", vf.path);
+                    // Record hash in deleted hashes
+                    if let Some(hash) = compute_file_hash(&vf.path) {
+                        deleted_hashes.insert(hash);
+                    }
+                }
+                Err(e) => eprintln!("  Trash failed: {} ({})", vf.path, e),
+            }
+            return true;
+        }
+        KEY_O => {
+            println!("  Opening in Finder: {}", vf.path);
+            let _ = Command::new("open").arg("-R").arg(&vf.path).output();
+            return true;
+        }
+        KEY_T => {
+            // OCR on current frame — extract frame via ffmpeg
+            let ocr_results = extract_ocr_from_video(&vf.path);
+            match ocr_results {
+                Ok(results) => {
+                    if results.is_empty() {
+                        println!("  OCR: (no text found)");
+                    } else {
+                        println!("  OCR -> {}:", vf.path);
+                        for r in &results {
+                            println!("    \"{}\" (conf {:.1})", r.text, r.confidence);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("  OCR warning: {}", e),
+            }
+            return false;
+        }
+        KEY_W => {
+            println!("  Adding Purple tag to: {}", vf.path);
+            let _ = filesystem::set_tag(&vf.path, "Purple");
+            return false;
+        }
+        KEY_U | KEY_Z => {
+            println!("  Undo: not implemented");
+            return false;
+        }
+        KEY_QMARK => {
+            *help_visible = !*help_visible;
+            return false;
+        }
+        KEY_SPACE => { // Space -> play/pause
+            *paused = !*paused;
+            if *paused {
+                println!("  Paused");
+            } else {
+                println!("  Playing");
+            }
+            return false;
+        }
+        KEY_LEFT1 | KEY_LEFT2 => { // Left arrow -> seek -30s
+            let new_pos = (*current_pos - 30.0).max(0.0);
+            *seek_target = Some(new_pos);
+            *current_pos = new_pos;
+            return false;
+        }
+        KEY_RIGHT1 | KEY_RIGHT2 => { // Right arrow -> seek +30s
+            let new_pos = (*current_pos + 30.0).min(duration_secs);
+            *seek_target = Some(new_pos);
+            *current_pos = new_pos;
+            return false;
+        }
+        KEY_UP1 | KEY_UP2 => { // Up arrow -> previous video
+            if *i > 0 {
+                *i -= 1;
+            }
+            return true;
+        }
+        KEY_DOWN1 | KEY_DOWN2 => { // Down arrow -> next video
+            return true;
+        }
+        _ => {
+            // unknown key, ignore
+            return false;
+        }
+    }
+}
+
+fn move_file(vf: &VideoFile, dest: &str) {
+    match filesystem::move_to_folder(&vf.path, dest) {
+        Ok(dest_path) => println!("  Moved: {} -> {}", vf.path, dest_path),
+        Err(e) => eprintln!("  Move failed: {} ({})", vf.path, e),
+    }
+}
+
+fn draw_ui_overlays(frame: &mut Mat, _vf: &VideoFile, index: usize, total: usize, _duration_secs: f64, _fps: f64, current_mins: i32, current_secs: i32, help_visible: bool) {
+    let width = frame.cols();
+    let height = frame.rows();
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let white = Scalar::new(255.0, 255.0, 255.0, 0.0);
+    let _yellow = Scalar::new(0.0, 255.0, 255.0, 0.0);
+
+    // Time display at top-left
+    let time_text = format!("Time: {:02}:{:02}", current_mins, current_secs);
+    let _ = imgproc::put_text_def(
+        frame,
+        &time_text,
+        Point::new(10, 30),
+        FONT_HERSHEY_SIMPLEX,
+        0.6,
+        white,
+    );
+
+    // File progress at bottom
+    let progress_text = format!("File {}/{}", index + 1, total);
+    let _ = imgproc::put_text_def(
+        frame,
+        &progress_text,
+        Point::new(10, height - 10),
+        FONT_HERSHEY_SIMPLEX,
+        0.5,
+        white,
+    );
+
+    // Progress bar at bottom
+    let bar_y = height - 25;
+    let bar_width = width - 20;
+    let _ = imgproc::rectangle_def(
+        frame,
+        Rect::new(10, bar_y, bar_width, 5),
+        Scalar::new(40.0, 40.0, 40.0, 0.0),
+    );
+
+    if help_visible {
+        draw_help_overlay(frame, width, height);
+    }
+}
+
+fn draw_help_overlay(frame: &mut Mat, width: i32, height: i32) {
+    let yellow = Scalar::new(0.0, 255.0, 255.0, 0.0);
+    let white = Scalar::new(255.0, 255.0, 255.0, 0.0);
+
+    // Semi-transparent overlay
+    let _ = imgproc::rectangle_def(
+        frame,
+        Rect::new(0, 0, width, height),
+        Scalar::new(0.0, 0.0, 0.0, 0.0),
+    );
+
+    let shortcuts = [
+        ("g", "Mark as Good"),
+        ("f", "Mark as Fine"),
+        ("d", "Delete (trash)"),
+        ("t", "OCR text detection"),
+        ("n", "Next video"),
+        ("u/z", "Undo last action"),
+        ("o", "Open in Finder"),
+        ("Space", "Play/Pause"),
+        ("←/→", "Seek -30s/+30s"),
+        ("↑/↓", "Prev/Next"),
+        ("w", "Add Purple tag"),
+        ("?", "Help overlay"),
+        ("q/Esc", "Quit"),
+    ];
+
+    let _ = imgproc::put_text_def(
+        frame,
+        "KEYBOARD SHORTCUTS",
+        Point::new(width / 2 - 100, 40),
+        FONT_HERSHEY_SIMPLEX,
+        0.8,
+        yellow,
+    );
+
+    for (j, (key, desc)) in shortcuts.iter().enumerate() {
+        let y = 80 + (j as i32) * 25;
+        let _ = imgproc::put_text_def(
+            frame,
+            key,
+            Point::new(30, y),
+            FONT_HERSHEY_SIMPLEX,
+            0.5,
+            yellow,
+        );
+        let _ = imgproc::put_text_def(
+            frame,
+            desc,
+            Point::new(100, y),
+            FONT_HERSHEY_SIMPLEX,
+            0.5,
+            white,
+        );
+    }
 }
