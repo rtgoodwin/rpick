@@ -136,7 +136,17 @@ pub fn run_scan(with_ocr: bool, min_dur: f64) {
         if with_ocr {
             let ocr_results = extract_ocr_from_video(&vf.path);
             match ocr_results {
-                Ok(results) => processed_vf.ocr_results = results,
+                Ok(results) => {
+                    if !results.is_empty() {
+                        println!("  OCR -> {}:", vf.path);
+                        for r in &results {
+                            println!("    \"{}\" (conf {:.1})", r.text, r.confidence);
+                        }
+                    } else {
+                        println!("  OCR -> {}: (no text found)", vf.path);
+                    }
+                    processed_vf.ocr_results = results;
+                }
                 Err(e) => eprintln!("  OCR warning: {}", e),
             }
         }
