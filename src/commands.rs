@@ -493,6 +493,9 @@ const KEY_T: i32 = 't' as i32;
 const KEY_W: i32 = 'w' as i32;
 const KEY_U: i32 = 'u' as i32;
 const KEY_Z: i32 = 'z' as i32;
+const KEY_C: i32 = 'c' as i32;
+const KEY_V: i32 = 'v' as i32;
+const KEY_FULLSCREEN: i32 = 'F' as i32;
 const KEY_QMARK: i32 = '?' as i32;
 const KEY_ESCAPE: i32 = 27;
 const KEY_SPACE: i32 = 32;
@@ -665,9 +668,17 @@ fn handle_key(key: i32, vf: &VideoFile, i: &mut usize, paused: &mut bool, help_v
     }
 
     match key {
-        KEY_Q | KEY_ESCAPE => { // q or Escape
+        KEY_Q => { // q -> quit
             println!("Quit");
             return true;
+        }
+        KEY_ESCAPE => { // Escape -> restore window if maximized
+            let cur = highgui::get_window_property("rpick", 0_i32).unwrap_or(0.0);
+            if cur > 0.5 {
+                println!("  Restored window");
+                let _ = highgui::set_window_property("rpick", 0_i32, 0.0);
+            }
+            return false;
         }
         KEY_N | KEY_A => { // n or a -> next
             return true;
@@ -738,16 +749,27 @@ fn handle_key(key: i32, vf: &VideoFile, i: &mut usize, paused: &mut bool, help_v
             }
             return false;
         }
-        KEY_LEFT1 | KEY_LEFT2 => { // Left arrow -> seek -30s
+        KEY_LEFT1 | KEY_LEFT2 | KEY_C => { // Left arrow -> seek -30s
             let new_pos = (*current_pos - 30.0).max(0.0);
             *seek_target = Some(new_pos);
             *current_pos = new_pos;
             return false;
         }
-        KEY_RIGHT1 | KEY_RIGHT2 => { // Right arrow -> seek +30s
+        KEY_RIGHT1 | KEY_RIGHT2 | KEY_V => { // Right arrow -> seek +30s
             let new_pos = (*current_pos + 30.0).min(duration_secs);
             *seek_target = Some(new_pos);
             *current_pos = new_pos;
+            return false;
+        }
+        KEY_FULLSCREEN => {                                              // f -> fullscreen toggle
+            let cur = highgui::get_window_property("rpick", 0_i32).unwrap_or(0.0);
+            if cur > 0.5 {
+                println!("  Restored window");
+                let _ = highgui::set_window_property("rpick", 0_i32, 0.0);
+            } else {
+                println!("  Maximizing to fullscreen");
+                let _ = highgui::set_window_property("rpick", 0_i32, 1.0);
+            }
             return false;
         }
         KEY_UP1 | KEY_UP2 => { // Up arrow -> previous video
