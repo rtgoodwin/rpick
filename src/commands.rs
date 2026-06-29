@@ -495,6 +495,7 @@ const KEY_U: i32 = 'u' as i32;
 const KEY_Z: i32 = 'z' as i32;
 const KEY_C: i32 = 'c' as i32;
 const KEY_V: i32 = 'v' as i32;
+const KEY_E: i32 = 'e' as i32;
 const KEY_FULLSCREEN: i32 = 'F' as i32;
 const KEY_QMARK: i32 = '?' as i32;
 const KEY_ESCAPE: i32 = 27;
@@ -576,6 +577,7 @@ pub fn run_normal(min_dur: f64) {
 
     let mut i = 0usize;
     let mut paused = false;
+    let mut quit_all = false;
 
     while i < filtered.len() {
         let vf = &filtered[i];
@@ -600,8 +602,13 @@ pub fn run_normal(min_dur: f64) {
         let mut seek_target: Option<f64> = None;
         let mut current_pos: f64 = 0.0;
 
+        // Frame timing: compute delay per frame based on FPS
+        let frame_delay_ms = if fps > 0.0 { (1000.0 / fps) as i32 } else { 33 };
+
         // Main playback loop
         loop {
+            let frame_start = std::time::Instant::now();
+
             // Handle pending seek
             if let Some(target) = seek_target.take() {
                 let ms = (target * 1000.0) as f64;
@@ -621,7 +628,7 @@ pub fn run_normal(min_dur: f64) {
                 // No frame available yet
                 let key = highgui::wait_key(15).unwrap_or(-1);
                 if key != -1 {
-                    let brk = handle_key(key, vf, &mut i, &mut paused, &mut help_visible, duration_secs, &mut seek_target, &mut current_pos, filtered.len(), &mut deleted_hashes);
+                    let brk = handle_key(key, vf, &mut i, &mut paused, &mut help_visible, duration_secs, &mut seek_target, &mut current_pos, filtered.len(), &mut deleted_hashes, &mut quit_all);
                     if brk {
                         break;
                     }
@@ -637,8 +644,15 @@ pub fn run_normal(min_dur: f64) {
             // Show frame
             let _ = highgui::imshow(window_name, &frame);
 
-            // Wait for key (1ms delay between frames for ~1000fps loop)
-            let key = highgui::wait_key(1).unwrap_or(-1);
+            // Wait for key — use frame-rate-aware delay so playback is not too fast
+            // Measure elapsed time since frame_start and only wait the remaining portion
+            let elapsed_ms = frame_start.elapsed().as_millis() as i32;
+            let wait_ms = if elapsed_ms < frame_delay_ms {
+                (frame_delay_ms - elapsed_ms).max(1)
+            } else {
+                1 // Already took longer than frame delay; minimal wait
+            };
+            let key = highgui::wait_key(wait_ms).unwrap_or(-1);
 
             // If help is visible, any key dismisses except '?'
             if help_visible && key != KEY_QMARK && key != -1 {
@@ -646,13 +660,20 @@ pub fn run_normal(min_dur: f64) {
                 continue;
             }
 
-            let brk = handle_key(key, vf, &mut i, &mut paused, &mut help_visible, duration_secs, &mut seek_target, &mut current_pos, filtered.len(), &mut deleted_hashes);
+            let brk = handle_key(key, vf, &mut i, &mut paused, &mut help_visible, duration_secs, &mut seek_target, &mut current_pos, filtered.len(), &mut deleted_hashes, &mut quit_all);
             if brk {
                 break;
             }
+
+            // If paused, we don't read the next frame; just keep displaying the current one
+            // The wait_key above already provides the delay
         }
 
         let _ = cap.release();
+
+        if quit_all {
+            break;
+        }
         i += 1;
     }
 
@@ -662,14 +683,15 @@ pub fn run_normal(min_dur: f64) {
 }
 
 /// Returns true if the caller should break out of the current video loop (next/quit)
-fn handle_key(key: i32, vf: &VideoFile, i: &mut usize, paused: &mut bool, help_visible: &mut bool, duration_secs: f64, seek_target: &mut Option<f64>, current_pos: &mut f64, _total: usize, deleted_hashes: &mut DeletedHashes) -> bool {
+fn handle_key(key: i32, vf: &VideoFile, i: &mut usize, paused: &mut bool, help_visible: &mut bool, duration_secs: f64, seek_target: &mut Option<f64>, current_pos: &mut f64, _total: usize, deleted_hashes: &mut DeletedHashes, quit_all: &mut bool) -> bool {
     if key == -1 {
         return false;
     }
 
     match key {
-        KEY_Q => { // q -> quit
+        KEY_Q => { // q -> quit entirely
             println!("Quit");
+            *quit_all = true;
             return true;
         }
         KEY_ESCAPE => { // Escape -> restore window if maximized
@@ -708,6 +730,12 @@ fn handle_key(key: i32, vf: &VideoFile, i: &mut usize, paused: &mut bool, help_v
             println!("  Opening in Finder: {}", vf.path);
             let _ = Command::new("open").arg("-R").arg(&vf.path).output();
             return true;
+        }
+        KEY_E => { // Jump to 75% of video duration (25% remaining)
+            let target = duration_secs * 0.75;
+            *seek_target = Some(target);
+            *current_pos = target;
+            return false;
         }
         KEY_T => {
             // OCR on current frame — extract frame via ffmpeg
@@ -795,7 +823,7 @@ fn move_file(vf: &VideoFile, dest: &str) {
     }
 }
 
-fn draw_ui_overlays(frame: &mut Mat, _vf: &VideoFile, index: usize, total: usize, _duration_secs: f64, _fps: f64, current_mins: i32, current_secs: i32, help_visible: bool) {
+fn draw_ui_overlays(frame: &mut Mat, _vf: &VideoFile, index: usize, total: usize, duration_secs: f64, _fps: f64, current_mins: i32, current_secs: i32, help_visible: bool) {
     let width = frame.cols();
     let height = frame.rows();
     if width == 0 || height == 0 {
@@ -804,6 +832,7 @@ fn draw_ui_overlays(frame: &mut Mat, _vf: &VideoFile, index: usize, total: usize
 
     let white = Scalar::new(255.0, 255.0, 255.0, 0.0);
     let _yellow = Scalar::new(0.0, 255.0, 255.0, 0.0);
+    let progress_color = Scalar::new(97.0, 175.0, 239.0, 0.0); // Blue
 
     // Time display at top-left
     let time_text = format!("Time: {:02}:{:02}", current_mins, current_secs);
@@ -811,6 +840,19 @@ fn draw_ui_overlays(frame: &mut Mat, _vf: &VideoFile, index: usize, total: usize
         frame,
         &time_text,
         Point::new(10, 30),
+        FONT_HERSHEY_SIMPLEX,
+        0.6,
+        white,
+    );
+
+    // Duration display at top-right
+    let dur_mins = (duration_secs / 60.0) as i32;
+    let dur_secs = (duration_secs % 60.0) as i32;
+    let dur_text = format!("{:02}:{:02}", dur_mins, dur_secs);
+    let _ = imgproc::put_text_def(
+        frame,
+        &dur_text,
+        Point::new(width - 60, 30),
         FONT_HERSHEY_SIMPLEX,
         0.6,
         white,
@@ -827,14 +869,29 @@ fn draw_ui_overlays(frame: &mut Mat, _vf: &VideoFile, index: usize, total: usize
         white,
     );
 
-    // Progress bar at bottom
+    // Progress bar at bottom — background + filled portion
     let bar_y = height - 25;
     let bar_width = width - 20;
+    // Background (dark gray)
     let _ = imgproc::rectangle_def(
         frame,
         Rect::new(10, bar_y, bar_width, 5),
         Scalar::new(40.0, 40.0, 40.0, 0.0),
     );
+    // Filled portion (blue) — proportional to current_pos / duration
+    let progress = if duration_secs > 0.0 {
+        (current_mins as f64 * 60.0 + current_secs as f64) / duration_secs
+    } else {
+        0.0
+    };
+    let filled_width = ((progress * bar_width as f64) as i32).max(0).min(bar_width);
+    if filled_width > 0 {
+        let _ = imgproc::rectangle_def(
+            frame,
+            Rect::new(10, bar_y, filled_width, 5),
+            progress_color,
+        );
+    }
 
     if help_visible {
         draw_help_overlay(frame, width, height);
@@ -862,10 +919,12 @@ fn draw_help_overlay(frame: &mut Mat, width: i32, height: i32) {
         ("o", "Open in Finder"),
         ("Space", "Play/Pause"),
         ("←/→", "Seek -30s/+30s"),
+        ("e", "Jump to 75%"),
         ("↑/↓", "Prev/Next"),
         ("w", "Add Purple tag"),
         ("?", "Help overlay"),
-        ("q/Esc", "Quit"),
+        ("q", "Quit"),
+        ("Esc", "Restore window"),
     ];
 
     let _ = imgproc::put_text_def(
