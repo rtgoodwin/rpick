@@ -475,10 +475,10 @@ pub fn run_fix_dur() {
 
 /// ── Normal (Playback) ────────────────────────────────────────────
 
-use opencv::core::{Mat, MatTraitConst, Scalar, Point, Rect};
+use opencv::core::{Mat, MatTraitConst, Scalar, Point, Rect, Size, BORDER_CONSTANT, copy_make_border_def};
 use opencv::highgui::{self, WINDOW_NORMAL};
 use opencv::videoio::{VideoCapture, CAP_PROP_FPS, CAP_PROP_FRAME_COUNT, CAP_PROP_POS_MSEC};
-use opencv::imgproc::{self, FONT_HERSHEY_SIMPLEX};
+use opencv::imgproc::{self, FONT_HERSHEY_SIMPLEX, resize_def};
 use opencv::prelude::{VideoCaptureTraitConst, VideoCaptureTrait};
 use std::process::Command;
 
@@ -574,6 +574,8 @@ pub fn run_normal(min_dur: f64) {
         eprintln!("Failed to create window: {}", e);
         return;
     }
+    // Set a sensible default window size (matches gopick's default)
+    let _ = highgui::resize_window(window_name, 960, 540);
 
     let mut i = 0usize;
     let mut paused = false;
@@ -636,13 +638,17 @@ pub fn run_normal(min_dur: f64) {
                 continue;
             }
 
-            // Draw overlays (pass mutable frame) with current position
+            // Center the frame into a canvas matching the window size (letter-boxed)
+            // so the video is always centered with symmetric black bars
+            let mut canvas = center_frame_in_window(&frame, window_name);
+
+            // Draw overlays on the canvas with current position
             let current_mins = (current_pos / 60.0) as i32;
             let current_secs = (current_pos % 60.0) as i32;
-            draw_ui_overlays(&mut frame, vf, i, filtered.len(), duration_secs, fps, current_mins, current_secs, help_visible);
+            draw_ui_overlays(&mut canvas, vf, i, filtered.len(), duration_secs, fps, current_mins, current_secs, help_visible);
 
-            // Show frame
-            let _ = highgui::imshow(window_name, &frame);
+            // Show canvas
+            let _ = highgui::imshow(window_name, &canvas);
 
             // Wait for key — use frame-rate-aware delay so playback is not too fast
             // Measure elapsed time since frame_start and only wait the remaining portion
@@ -821,6 +827,58 @@ fn move_file(vf: &VideoFile, dest: &str) {
         Ok(dest_path) => println!("  Moved: {} -> {}", vf.path, dest_path),
         Err(e) => eprintln!("  Move failed: {} ({})", vf.path, e),
     }
+}
+
+/// Create a centered, letter-boxed frame matching the window's content area.
+/// Prevents OpenCV from anchoring the video to the top-left corner and ensures
+/// symmetric black bars when the window aspect ratio differs from the video's.
+/// Matches gopick's centerFrameInWindow behavior.
+fn center_frame_in_window(frame: &Mat, window_name: &str) -> Mat {
+    let frame_w = frame.cols();
+    let frame_h = frame.rows();
+    if frame_w == 0 || frame_h == 0 {
+        return Mat::default();
+    }
+
+    // Get the actual window content area dimensions
+    let (target_w, target_h) = match highgui::get_window_image_rect(window_name) {
+        Ok(r) if r.width > 0 && r.height > 0 => (r.width, r.height),
+        _ => (frame_w, frame_h), // fallback to frame size if window rect unavailable
+    };
+
+    // Scale preserving aspect ratio (fit within the window area)
+    let scale_x = target_w as f64 / frame_w as f64;
+    let scale_y = target_h as f64 / frame_h as f64;
+    let scale = scale_x.min(scale_y);
+    let new_w = ((frame_w as f64) * scale).round() as i32;
+    let new_h = ((frame_h as f64) * scale).round() as i32;
+
+    // Clamp to the target so borders are never negative
+    let new_w = new_w.min(target_w).max(1);
+    let new_h = new_h.min(target_h).max(1);
+
+    // Resize the video frame preserving aspect ratio
+    let mut resized = Mat::default();
+    if resize_def(frame, &mut resized, Size::new(new_w, new_h)).is_err() {
+        return frame.clone(); // fallback: show original frame
+    }
+
+    // If the resized frame already fills the window, no borders needed
+    if new_w == target_w && new_h == target_h {
+        return resized;
+    }
+
+    // Add centered black borders to match the window dimensions exactly
+    let top = (target_h - new_h) / 2;
+    let bottom = target_h - new_h - top;
+    let left = (target_w - new_w) / 2;
+    let right = target_w - new_w - left;
+
+    let mut canvas = Mat::default();
+    if copy_make_border_def(&resized, &mut canvas, top, bottom, left, right, BORDER_CONSTANT).is_err() {
+        return resized;
+    }
+    canvas
 }
 
 fn draw_ui_overlays(frame: &mut Mat, _vf: &VideoFile, index: usize, total: usize, duration_secs: f64, _fps: f64, current_mins: i32, current_secs: i32, help_visible: bool) {
