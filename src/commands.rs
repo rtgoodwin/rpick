@@ -212,7 +212,7 @@ fn extract_ocr_from_video(path: &str) -> Result<Vec<crate::video::OcrResult>, St
         .args([
             "-v",
             "error",
-            "-y",                     // overwrite output
+            "-y", // overwrite output
             "-i",
             path,
             "-vf",
@@ -474,13 +474,114 @@ pub fn run_fix_dur() {
 }
 
 /// ── Normal (Playback) ────────────────────────────────────────────
-
-use opencv::core::{Mat, MatTraitConst, Scalar, Point, Rect, Size, BORDER_CONSTANT, copy_make_border_def};
+use opencv::core::{
+    BORDER_CONSTANT, CV_8UC3, Mat, MatTraitConst, Point, Rect, Scalar, Size, copy_make_border_def,
+};
 use opencv::highgui::{self, WINDOW_NORMAL};
-use opencv::videoio::{VideoCapture, CAP_PROP_FPS, CAP_PROP_FRAME_COUNT, CAP_PROP_POS_MSEC};
 use opencv::imgproc::{self, FONT_HERSHEY_SIMPLEX, resize_def};
-use opencv::prelude::{VideoCaptureTraitConst, VideoCaptureTrait};
+use opencv::prelude::{VideoCaptureTrait, VideoCaptureTraitConst};
+use opencv::videoio::{CAP_PROP_FPS, CAP_PROP_FRAME_COUNT, CAP_PROP_POS_MSEC, VideoCapture};
 use std::process::Command;
+
+#[cfg(target_os = "macos")]
+mod window_native {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_double, c_int};
+
+    unsafe extern "C" {
+        fn rpick_set_window_aspect_ratio(
+            title: *const c_char,
+            width: c_double,
+            height: c_double,
+        ) -> c_int;
+        fn rpick_clear_window_aspect_ratio(title: *const c_char) -> c_int;
+        fn rpick_get_window_content_size(
+            title: *const c_char,
+            out_width: *mut c_int,
+            out_height: *mut c_int,
+        ) -> c_int;
+        fn rpick_set_window_standard_decorations(title: *const c_char) -> c_int;
+        fn rpick_toggle_window_fullscreen(title: *const c_char) -> c_int;
+        fn rpick_is_window_fullscreen(title: *const c_char) -> c_int;
+    }
+
+    fn c_title(title: &str) -> Option<CString> {
+        CString::new(title).ok()
+    }
+
+    pub fn set_aspect_ratio(title: &str, width: f64, height: f64) -> bool {
+        let Some(title) = c_title(title) else {
+            return false;
+        };
+        unsafe { rpick_set_window_aspect_ratio(title.as_ptr(), width, height) == 1 }
+    }
+
+    pub fn clear_aspect_ratio(title: &str) -> bool {
+        let Some(title) = c_title(title) else {
+            return false;
+        };
+        unsafe { rpick_clear_window_aspect_ratio(title.as_ptr()) == 1 }
+    }
+
+    pub fn get_content_size(title: &str) -> Option<(i32, i32)> {
+        let title = c_title(title)?;
+        let mut width: c_int = 0;
+        let mut height: c_int = 0;
+        let ok =
+            unsafe { rpick_get_window_content_size(title.as_ptr(), &mut width, &mut height) == 1 };
+        if ok && width > 0 && height > 0 {
+            Some((width, height))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_standard_decorations(title: &str) -> bool {
+        let Some(title) = c_title(title) else {
+            return false;
+        };
+        unsafe { rpick_set_window_standard_decorations(title.as_ptr()) == 1 }
+    }
+
+    pub fn toggle_fullscreen(title: &str) -> bool {
+        let Some(title) = c_title(title) else {
+            return false;
+        };
+        unsafe { rpick_toggle_window_fullscreen(title.as_ptr()) == 1 }
+    }
+
+    pub fn is_fullscreen(title: &str) -> bool {
+        let Some(title) = c_title(title) else {
+            return false;
+        };
+        unsafe { rpick_is_window_fullscreen(title.as_ptr()) == 1 }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod window_native {
+    pub fn set_aspect_ratio(_title: &str, _width: f64, _height: f64) -> bool {
+        false
+    }
+    pub fn clear_aspect_ratio(_title: &str) -> bool {
+        false
+    }
+    pub fn get_content_size(_title: &str) -> Option<(i32, i32)> {
+        None
+    }
+    pub fn set_standard_decorations(_title: &str) -> bool {
+        false
+    }
+    pub fn toggle_fullscreen(_title: &str) -> bool {
+        false
+    }
+    pub fn is_fullscreen(_title: &str) -> bool {
+        false
+    }
+}
+
+const PLAYER_ASPECT_W: f64 = 16.0;
+const PLAYER_ASPECT_H: f64 = 9.0;
 
 const KEY_Q: i32 = 'q' as i32;
 const KEY_N: i32 = 'n' as i32;
@@ -527,10 +628,13 @@ pub fn run_normal(min_dur: f64) {
 
     println!("Found {} video files", video_files.len());
 
+    let mut cache = load_cache();
+    let mut cache_changed = false;
+
     let pb = ProgressBar::new(video_files.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner} Probing {pos}/{len} videos [{elapsed}]")
+            .template("{spinner} Loading metadata {pos}/{len} videos [{elapsed}] {msg}")
             .unwrap(),
     );
 
@@ -538,12 +642,32 @@ pub fn run_normal(min_dur: f64) {
     for mut vf in video_files {
         pb.inc(1);
         pb.set_message(vf.path.clone());
-        if let Some(dur) = probe_duration(&vf.path) {
+
+        let cached = cache.get(&vf.path).cloned();
+        let use_cache = cached
+            .as_ref()
+            .map(|info| !VideoFileCache::is_stale(&vf.path, info) && info.duration > 0.0)
+            .unwrap_or(false);
+
+        if use_cache {
+            if let Some(info) = cached {
+                vf.duration = info.duration;
+                vf.hash = info.hash;
+                vf.ocr_results = info.ocr_results;
+            }
+        } else if let Some(dur) = probe_duration(&vf.path) {
             vf.duration = dur;
+            cache.set(vf.path.clone(), (&vf).into());
+            cache_changed = true;
         }
+
         with_dur.push(vf);
     }
     pb.finish_and_clear();
+
+    if cache_changed {
+        save_cache(&cache);
+    }
 
     let cfg = make_config(min_dur);
     let filtered: Vec<VideoFile> = if cfg.min_duration_secs > 0.0 {
@@ -574,8 +698,30 @@ pub fn run_normal(min_dur: f64) {
         eprintln!("Failed to create window: {}", e);
         return;
     }
-    // Set a sensible default window size (matches gopick's default)
+    // Set a sensible default 16:9 player frame (matches gopick's default)
     let _ = highgui::resize_window(window_name, 960, 540);
+
+    // Show an initial frame so the native Cocoa NSWindow exists before configuring it.
+    if let Ok(init_frame) =
+        Mat::new_rows_cols_with_default(540, 960, CV_8UC3, Scalar::new(30.0, 30.0, 30.0, 0.0))
+    {
+        let _ = highgui::imshow(window_name, &init_frame);
+        let _ = highgui::wait_key(1);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    for _ in 0..10 {
+        if window_native::set_standard_decorations(window_name) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for _ in 0..10 {
+        if window_native::set_aspect_ratio(window_name, PLAYER_ASPECT_W, PLAYER_ASPECT_H) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 
     let mut i = 0usize;
     let mut paused = false;
@@ -597,7 +743,11 @@ pub fn run_normal(min_dur: f64) {
 
         let fps = cap.get(CAP_PROP_FPS).unwrap_or(30.0);
         let frame_count = cap.get(CAP_PROP_FRAME_COUNT).unwrap_or(0.0);
-        let duration_secs = if fps > 0.0 { frame_count / fps } else { vf.duration };
+        let duration_secs = if fps > 0.0 {
+            frame_count / fps
+        } else {
+            vf.duration
+        };
 
         let mut frame = Mat::default();
         let mut help_visible = false;
@@ -620,7 +770,9 @@ pub fn run_normal(min_dur: f64) {
             if !paused {
                 match cap.read(&mut frame) {
                     Ok(true) => {}
-                    _ => { break; }
+                    _ => {
+                        break;
+                    }
                 }
                 // Track current position from the frame
                 current_pos = cap.get(CAP_PROP_POS_MSEC).unwrap_or(0.0) / 1000.0;
@@ -630,7 +782,19 @@ pub fn run_normal(min_dur: f64) {
                 // No frame available yet
                 let key = highgui::wait_key(15).unwrap_or(-1);
                 if key != -1 {
-                    let brk = handle_key(key, vf, &mut i, &mut paused, &mut help_visible, duration_secs, &mut seek_target, &mut current_pos, filtered.len(), &mut deleted_hashes, &mut quit_all);
+                    let brk = handle_key(
+                        key,
+                        vf,
+                        &mut i,
+                        &mut paused,
+                        &mut help_visible,
+                        duration_secs,
+                        &mut seek_target,
+                        &mut current_pos,
+                        filtered.len(),
+                        &mut deleted_hashes,
+                        &mut quit_all,
+                    );
                     if brk {
                         break;
                     }
@@ -645,7 +809,17 @@ pub fn run_normal(min_dur: f64) {
             // Draw overlays on the canvas with current position
             let current_mins = (current_pos / 60.0) as i32;
             let current_secs = (current_pos % 60.0) as i32;
-            draw_ui_overlays(&mut canvas, vf, i, filtered.len(), duration_secs, fps, current_mins, current_secs, help_visible);
+            draw_ui_overlays(
+                &mut canvas,
+                vf,
+                i,
+                filtered.len(),
+                duration_secs,
+                fps,
+                current_mins,
+                current_secs,
+                help_visible,
+            );
 
             // Show canvas
             let _ = highgui::imshow(window_name, &canvas);
@@ -666,7 +840,19 @@ pub fn run_normal(min_dur: f64) {
                 continue;
             }
 
-            let brk = handle_key(key, vf, &mut i, &mut paused, &mut help_visible, duration_secs, &mut seek_target, &mut current_pos, filtered.len(), &mut deleted_hashes, &mut quit_all);
+            let brk = handle_key(
+                key,
+                vf,
+                &mut i,
+                &mut paused,
+                &mut help_visible,
+                duration_secs,
+                &mut seek_target,
+                &mut current_pos,
+                filtered.len(),
+                &mut deleted_hashes,
+                &mut quit_all,
+            );
             if brk {
                 break;
             }
@@ -689,26 +875,55 @@ pub fn run_normal(min_dur: f64) {
 }
 
 /// Returns true if the caller should break out of the current video loop (next/quit)
-fn handle_key(key: i32, vf: &VideoFile, i: &mut usize, paused: &mut bool, help_visible: &mut bool, duration_secs: f64, seek_target: &mut Option<f64>, current_pos: &mut f64, _total: usize, deleted_hashes: &mut DeletedHashes, quit_all: &mut bool) -> bool {
+fn normalize_key(key: i32) -> i32 {
+    match key {
+        // Preserve extended arrow-key codes before low-byte normalization.
+        KEY_LEFT1 | KEY_LEFT2 | KEY_RIGHT1 | KEY_RIGHT2 | KEY_UP1 | KEY_UP2 | KEY_DOWN1
+        | KEY_DOWN2 => key,
+        // Some HighGUI backends include modifier/high bits with printable keys.
+        // Keep ASCII semantics so lowercase f (Fine) and uppercase F (fullscreen)
+        // stay distinct when the low byte is correct.
+        k if k > 255 => k & 0xff,
+        k => k,
+    }
+}
+
+fn handle_key(
+    key: i32,
+    vf: &VideoFile,
+    i: &mut usize,
+    paused: &mut bool,
+    help_visible: &mut bool,
+    duration_secs: f64,
+    seek_target: &mut Option<f64>,
+    current_pos: &mut f64,
+    _total: usize,
+    deleted_hashes: &mut DeletedHashes,
+    quit_all: &mut bool,
+) -> bool {
     if key == -1 {
         return false;
     }
+    let key = normalize_key(key);
 
     match key {
-        KEY_Q => { // q -> quit entirely
+        KEY_Q => {
+            // q -> quit entirely
             println!("Quit");
             *quit_all = true;
             return true;
         }
-        KEY_ESCAPE => { // Escape -> restore window if maximized
-            let cur = highgui::get_window_property("rpick", 0_i32).unwrap_or(0.0);
-            if cur > 0.5 {
+        KEY_ESCAPE => {
+            // Escape -> restore window if fullscreen
+            if window_native::is_fullscreen("rpick") {
                 println!("  Restored window");
-                let _ = highgui::set_window_property("rpick", 0_i32, 0.0);
+                let _ = window_native::toggle_fullscreen("rpick");
+                let _ = window_native::set_aspect_ratio("rpick", PLAYER_ASPECT_W, PLAYER_ASPECT_H);
             }
             return false;
         }
-        KEY_N | KEY_A => { // n or a -> next
+        KEY_N | KEY_A => {
+            // n or a -> next
             return true;
         }
         KEY_G => {
@@ -737,8 +952,9 @@ fn handle_key(key: i32, vf: &VideoFile, i: &mut usize, paused: &mut bool, help_v
             let _ = Command::new("open").arg("-R").arg(&vf.path).output();
             return true;
         }
-        KEY_E => { // Jump to 75% of video duration (25% remaining)
-            let target = duration_secs * 0.75;
+        KEY_E => {
+            // Jump near the end (95% of video duration)
+            let target = duration_secs * 0.95;
             *seek_target = Some(target);
             *current_pos = target;
             return false;
@@ -774,7 +990,8 @@ fn handle_key(key: i32, vf: &VideoFile, i: &mut usize, paused: &mut bool, help_v
             *help_visible = !*help_visible;
             return false;
         }
-        KEY_SPACE => { // Space -> play/pause
+        KEY_SPACE => {
+            // Space -> play/pause
             *paused = !*paused;
             if *paused {
                 println!("  Paused");
@@ -783,36 +1000,42 @@ fn handle_key(key: i32, vf: &VideoFile, i: &mut usize, paused: &mut bool, help_v
             }
             return false;
         }
-        KEY_LEFT1 | KEY_LEFT2 | KEY_C => { // Left arrow -> seek -30s
+        KEY_LEFT1 | KEY_LEFT2 | KEY_C => {
+            // Left arrow -> seek -30s
             let new_pos = (*current_pos - 30.0).max(0.0);
             *seek_target = Some(new_pos);
             *current_pos = new_pos;
             return false;
         }
-        KEY_RIGHT1 | KEY_RIGHT2 | KEY_V => { // Right arrow -> seek +30s
+        KEY_RIGHT1 | KEY_RIGHT2 | KEY_V => {
+            // Right arrow -> seek +30s
             let new_pos = (*current_pos + 30.0).min(duration_secs);
             *seek_target = Some(new_pos);
             *current_pos = new_pos;
             return false;
         }
-        KEY_FULLSCREEN => {                                              // f -> fullscreen toggle
-            let cur = highgui::get_window_property("rpick", 0_i32).unwrap_or(0.0);
-            if cur > 0.5 {
+        KEY_FULLSCREEN => {
+            // Uppercase F -> fullscreen toggle
+            if window_native::is_fullscreen("rpick") {
                 println!("  Restored window");
-                let _ = highgui::set_window_property("rpick", 0_i32, 0.0);
+                let _ = window_native::toggle_fullscreen("rpick");
+                let _ = window_native::set_aspect_ratio("rpick", PLAYER_ASPECT_W, PLAYER_ASPECT_H);
             } else {
                 println!("  Maximizing to fullscreen");
-                let _ = highgui::set_window_property("rpick", 0_i32, 1.0);
+                let _ = window_native::clear_aspect_ratio("rpick");
+                let _ = window_native::toggle_fullscreen("rpick");
             }
             return false;
         }
-        KEY_UP1 | KEY_UP2 => { // Up arrow -> previous video
+        KEY_UP1 | KEY_UP2 => {
+            // Up arrow -> previous video
             if *i > 0 {
                 *i -= 1;
             }
             return true;
         }
-        KEY_DOWN1 | KEY_DOWN2 => { // Down arrow -> next video
+        KEY_DOWN1 | KEY_DOWN2 => {
+            // Down arrow -> next video
             return true;
         }
         _ => {
@@ -840,11 +1063,16 @@ fn center_frame_in_window(frame: &Mat, window_name: &str) -> Mat {
         return Mat::default();
     }
 
-    // Get the actual window content area dimensions
-    let (target_w, target_h) = match highgui::get_window_image_rect(window_name) {
-        Ok(r) if r.width > 0 && r.height > 0 => (r.width, r.height),
-        _ => (frame_w, frame_h), // fallback to frame size if window rect unavailable
-    };
+    // Get the actual native Cocoa content area dimensions. OpenCV's
+    // get_window_image_rect can be stale on macOS during live resize/fullscreen.
+    let (target_w, target_h) = window_native::get_content_size(window_name)
+        .or_else(|| {
+            highgui::get_window_image_rect(window_name)
+                .ok()
+                .map(|r| (r.width, r.height))
+        })
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .unwrap_or((frame_w, frame_h));
 
     // Scale preserving aspect ratio (fit within the window area)
     let scale_x = target_w as f64 / frame_w as f64;
@@ -875,13 +1103,33 @@ fn center_frame_in_window(frame: &Mat, window_name: &str) -> Mat {
     let right = target_w - new_w - left;
 
     let mut canvas = Mat::default();
-    if copy_make_border_def(&resized, &mut canvas, top, bottom, left, right, BORDER_CONSTANT).is_err() {
+    if copy_make_border_def(
+        &resized,
+        &mut canvas,
+        top,
+        bottom,
+        left,
+        right,
+        BORDER_CONSTANT,
+    )
+    .is_err()
+    {
         return resized;
     }
     canvas
 }
 
-fn draw_ui_overlays(frame: &mut Mat, _vf: &VideoFile, index: usize, total: usize, duration_secs: f64, _fps: f64, current_mins: i32, current_secs: i32, help_visible: bool) {
+fn draw_ui_overlays(
+    frame: &mut Mat,
+    _vf: &VideoFile,
+    index: usize,
+    total: usize,
+    duration_secs: f64,
+    _fps: f64,
+    current_mins: i32,
+    current_secs: i32,
+    help_visible: bool,
+) {
     let width = frame.cols();
     let height = frame.rows();
     if width == 0 || height == 0 {
@@ -944,11 +1192,8 @@ fn draw_ui_overlays(frame: &mut Mat, _vf: &VideoFile, index: usize, total: usize
     };
     let filled_width = ((progress * bar_width as f64) as i32).max(0).min(bar_width);
     if filled_width > 0 {
-        let _ = imgproc::rectangle_def(
-            frame,
-            Rect::new(10, bar_y, filled_width, 5),
-            progress_color,
-        );
+        let _ =
+            imgproc::rectangle_def(frame, Rect::new(10, bar_y, filled_width, 5), progress_color);
     }
 
     if help_visible {
@@ -977,7 +1222,7 @@ fn draw_help_overlay(frame: &mut Mat, width: i32, height: i32) {
         ("o", "Open in Finder"),
         ("Space", "Play/Pause"),
         ("←/→", "Seek -30s/+30s"),
-        ("e", "Jump to 75%"),
+        ("e", "Jump to end (95%)"),
         ("↑/↓", "Prev/Next"),
         ("w", "Add Purple tag"),
         ("?", "Help overlay"),

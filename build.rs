@@ -10,12 +10,13 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=ImageIO");
         println!("cargo:rustc-link-lib=framework=Cocoa");
 
-        // Compile the Objective-C helper
+        // Compile the Objective-C helpers
         cc::Build::new()
             .file("src/vision_helper.m")
+            .file("src/window_helper.m")
             .flag("-fobjc-arc")
             .flag("-x")
             .flag("objective-c")
-            .compile("vision_helper");
+            .compile("rpick_objc_helpers");
     }
 }
