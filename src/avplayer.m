@@ -281,7 +281,15 @@ static NSButton* makeSymbolBtn(NSString *symbol, CGFloat size, SEL action, id ta
 void avplayer_init(void) {
     g_key_lock = [[NSLock alloc] init];
 
+    // AIDEV-NOTE: NSApp is nil until [NSApplication sharedApplication] runs.
+    // Previously this happened implicitly via OpenCV's Cocoa HighGUI backend;
+    // now that we own the window directly we must bootstrap it ourselves, or
+    // every subsequent [NSApp ...] call (menu, activation, event pump) is a
+    // silent no-op on nil — which is why the app never appeared in the Dock
+    // and no keystrokes were delivered.
+    [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp finishLaunching];
 
     // Basic menu so Cmd+Q works
     NSMenu *menubar = [[NSMenu alloc] init];
