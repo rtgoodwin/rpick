@@ -6,9 +6,15 @@
 //! Rust-accessible ring buffer rather than calling back across FFI.
 
 #import <Cocoa/Cocoa.h>
-#import <AVKit/AVKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+
+// AIDEV-NOTE: We intentionally avoid AVKit's AVPlayerView here. AVPlayerView
+// internally sets up a KVO observation on "currentVideoTrack.preferredTransform"
+// for its auto-rotation handling, which logs a benign but noisy
+// "unrecognized keys" warning for some MP4 files. A raw AVPlayerLayer hosted
+// in a plain NSView bypasses that code path entirely and gives the same
+// aspect-fit letterboxing via videoGravity, with full control over layout.
 
 // ── Thread-safe key event ring buffer (polled by Rust) ──────────────
 #define KEY_QUEUE_CAPACITY 64
@@ -39,11 +45,28 @@ int avplayer_poll_key(void) {
     return key;
 }
 
+// ── Player-layer-backed view (hosts AVPlayerLayer directly) ─────────
+@interface PlayerLayerView : NSView
+@end
+@implementation PlayerLayerView
+- (CALayer *)makeBackingLayer {
+    AVPlayerLayer *layer = [AVPlayerLayer layer];
+    layer.videoGravity = AVLayerVideoGravityResizeAspect;
+    layer.backgroundColor = [[NSColor blackColor] CGColor];
+    return layer;
+}
+- (AVPlayerLayer *)playerLayer {
+    return (AVPlayerLayer *)self.layer;
+}
+@end
+
 // ── Global UI state ─────────────────────────────────────────────────
 static NSWindow          *g_window           = nil;
-static AVPlayerView      *g_playerView       = nil;
+static PlayerLayerView   *g_playerView       = nil;
 static AVPlayer          *g_player           = nil;
 static id                 g_timeObserver     = nil;
+static id                 g_endObserver      = nil;
+static id                 g_windowDelegate   = nil; // strong ref; NSWindow.delegate is weak
 static volatile BOOL      g_sliderInUse      = NO;
 static volatile BOOL      g_videoFinished    = NO;
 static volatile BOOL      g_helpVisible      = NO;
@@ -281,18 +304,17 @@ void avplayer_init(void) {
     g_window.titlebarAppearsTransparent = YES;
     g_window.titleVisibility = NSWindowTitleHidden;
     g_window.minSize = NSMakeSize(480, 320);
-    g_window.delegate = [[PlayerDelegate alloc] init];
+    g_windowDelegate = [[PlayerDelegate alloc] init];
+    g_window.delegate = g_windowDelegate;
     [g_window center];
 
     NSView *content = g_window.contentView;
     content.wantsLayer = YES;
 
-    // ── AVPlayerView ──────────────────────────────────────────────────
-    g_playerView = [[AVPlayerView alloc] init];
+    // ── Player layer view (raw AVPlayerLayer, no AVKit) ────────────────
+    g_playerView = [[PlayerLayerView alloc] init];
     g_playerView.translatesAutoresizingMaskIntoConstraints = NO;
-    g_playerView.controlsStyle = AVPlayerViewControlsStyleNone;
-    g_playerView.wantsLayer = YES;
-    g_playerView.layer.backgroundColor = [[NSColor blackColor] CGColor];
+    g_playerView.wantsLayer = YES; // triggers makeBackingLayer above
 
     // ── Key-capturing content (replaces stock contentView's event handling) ──
     KeyView *keyView = [[KeyView alloc] init];
@@ -425,6 +447,7 @@ void avplayer_init(void) {
     [g_player seekToTime:CMTimeMakeWithSeconds(secs, 600)
          toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero
        completionHandler:^(BOOL done) {
+        (void)done;
         dispatch_async(dispatch_get_main_queue(), ^{ g_sliderInUse = NO; });
     }];
 }
@@ -495,25 +518,28 @@ void avplayer_load(const char *path) {
             g_timeObserver = nil;
         }
 
-        // Remove old end-of-playback observer
-        [[NSNotificationCenter defaultCenter] removeObserver:nil
-            name:AVPlayerItemDidPlayToEndTimeNotification object:nil];
+        // Remove old end-of-playback observer (tracked by token, not nil)
+        if (g_endObserver) {
+            [[NSNotificationCenter defaultCenter] removeObserver:g_endObserver];
+            g_endObserver = nil;
+        }
 
         NSURL *url = [NSURL fileURLWithPath:p];
         AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
 
         if (!g_player) {
             g_player = [AVPlayer playerWithPlayerItem:item];
-            g_playerView.player = g_player;
+            g_playerView.playerLayer.player = g_player;
             wire_controls();
         } else {
             [g_player replaceCurrentItemWithPlayerItem:item];
         }
 
         // End-of-playback notification
-        [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
+        g_endObserver = [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
             object:item queue:[NSOperationQueue mainQueue]
             usingBlock:^(NSNotification *n) {
+                (void)n;
                 g_videoFinished = YES;
                 KeyView *kv = (KeyView *)g_window.contentView.subviews[0];
                 [kv setPlaying:NO];
