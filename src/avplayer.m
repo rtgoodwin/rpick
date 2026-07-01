@@ -500,7 +500,14 @@ void avplayer_load(const char *path) {
             name:AVPlayerItemDidPlayToEndTimeNotification object:nil];
 
         NSURL *url = [NSURL fileURLWithPath:p];
-        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
+
+        // Use AVURLAsset with explicit key loading to avoid
+        // "unrecognized keys (preferredTransform)" warnings.
+        AVURLAsset *asset = [AVURLAsset assetWithURL:url];
+        NSArray *keys = @[@"duration", @"playable", @"tracks"];
+
+        AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:asset
+                            automaticallyLoadedAssetKeys:keys];
 
         if (!g_player) {
             g_player = [AVPlayer playerWithPlayerItem:item];
