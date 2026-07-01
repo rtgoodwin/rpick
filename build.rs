@@ -9,11 +9,16 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=ImageIO");
         println!("cargo:rustc-link-lib=framework=Cocoa");
+        println!("cargo:rustc-link-lib=framework=AVKit");
+        println!("cargo:rustc-link-lib=framework=AVFoundation");
+        println!("cargo:rustc-link-lib=framework=CoreMedia");
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
 
         // Compile the Objective-C helpers
         cc::Build::new()
             .file("src/vision_helper.m")
             .file("src/window_helper.m")
+            .file("src/avplayer.m")
             .flag("-fobjc-arc")
             .flag("-x")
             .flag("objective-c")

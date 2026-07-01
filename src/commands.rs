@@ -6,6 +6,7 @@ use crate::filesystem;
 use crate::ocr;
 use crate::video::{VideoFile, VideoFileState};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::process::Command;
 
 /// ── Helper ───────────────────────────────────────────────────────
 
@@ -474,114 +475,113 @@ pub fn run_fix_dur() {
 }
 
 /// ── Normal (Playback) ────────────────────────────────────────────
-use opencv::core::{
-    BORDER_CONSTANT, CV_8UC3, Mat, MatTraitConst, Point, Rect, Scalar, Size, copy_make_border_def,
-};
-use opencv::highgui::{self, WINDOW_NORMAL};
-use opencv::imgproc::{self, FONT_HERSHEY_SIMPLEX, resize_def};
-use opencv::prelude::{VideoCaptureTrait, VideoCaptureTraitConst};
-use opencv::videoio::{CAP_PROP_FPS, CAP_PROP_FRAME_COUNT, CAP_PROP_POS_MSEC, VideoCapture};
-use std::process::Command;
 
 #[cfg(target_os = "macos")]
-mod window_native {
-    use std::ffi::CString;
-    use std::os::raw::{c_char, c_double, c_int};
+mod avplayer {
+    use std::ffi::{c_char, c_double, c_int, CString};
 
     unsafe extern "C" {
-        fn rpick_set_window_aspect_ratio(
-            title: *const c_char,
-            width: c_double,
-            height: c_double,
-        ) -> c_int;
-        fn rpick_clear_window_aspect_ratio(title: *const c_char) -> c_int;
-        fn rpick_get_window_content_size(
-            title: *const c_char,
-            out_width: *mut c_int,
-            out_height: *mut c_int,
-        ) -> c_int;
-        fn rpick_set_window_standard_decorations(title: *const c_char) -> c_int;
-        fn rpick_toggle_window_fullscreen(title: *const c_char) -> c_int;
-        fn rpick_is_window_fullscreen(title: *const c_char) -> c_int;
+        pub fn avplayer_init();
+        pub fn avplayer_destroy();
+        pub fn avplayer_load(path: *const c_char);
+        pub fn avplayer_play();
+        pub fn avplayer_pause();
+        pub fn avplayer_is_playing() -> c_int;
+        pub fn avplayer_current_time() -> c_double;
+        pub fn avplayer_duration() -> c_double;
+        pub fn avplayer_did_finish() -> c_int;
+        pub fn avplayer_seek(seconds: c_double);
+        pub fn avplayer_seek_fraction(fraction: c_double);
+        pub fn avplayer_toggle_fullscreen();
+        pub fn avplayer_is_fullscreen() -> c_int;
+        pub fn avplayer_set_file_label(text: *const c_char);
+        pub fn avplayer_pump_once();
+        pub fn avplayer_poll_key() -> c_int;
     }
 
-    fn c_title(title: &str) -> Option<CString> {
-        CString::new(title).ok()
+    fn c_str(s: &str) -> Option<CString> {
+        CString::new(s).ok()
     }
 
-    pub fn set_aspect_ratio(title: &str, width: f64, height: f64) -> bool {
-        let Some(title) = c_title(title) else {
-            return false;
-        };
-        unsafe { rpick_set_window_aspect_ratio(title.as_ptr(), width, height) == 1 }
+    pub fn init() {
+        unsafe { avplayer_init() }
     }
-
-    pub fn clear_aspect_ratio(title: &str) -> bool {
-        let Some(title) = c_title(title) else {
-            return false;
-        };
-        unsafe { rpick_clear_window_aspect_ratio(title.as_ptr()) == 1 }
+    pub fn destroy() {
+        unsafe { avplayer_destroy() }
     }
-
-    pub fn get_content_size(title: &str) -> Option<(i32, i32)> {
-        let title = c_title(title)?;
-        let mut width: c_int = 0;
-        let mut height: c_int = 0;
-        let ok =
-            unsafe { rpick_get_window_content_size(title.as_ptr(), &mut width, &mut height) == 1 };
-        if ok && width > 0 && height > 0 {
-            Some((width, height))
-        } else {
-            None
-        }
+    pub fn load(path: &str) {
+        let p = c_str(path).unwrap_or_default();
+        unsafe { avplayer_load(p.as_ptr()) }
     }
-
-    pub fn set_standard_decorations(title: &str) -> bool {
-        let Some(title) = c_title(title) else {
-            return false;
-        };
-        unsafe { rpick_set_window_standard_decorations(title.as_ptr()) == 1 }
+    pub fn play() {
+        unsafe { avplayer_play() }
     }
-
-    pub fn toggle_fullscreen(title: &str) -> bool {
-        let Some(title) = c_title(title) else {
-            return false;
-        };
-        unsafe { rpick_toggle_window_fullscreen(title.as_ptr()) == 1 }
+    pub fn pause() {
+        unsafe { avplayer_pause() }
     }
-
-    pub fn is_fullscreen(title: &str) -> bool {
-        let Some(title) = c_title(title) else {
-            return false;
-        };
-        unsafe { rpick_is_window_fullscreen(title.as_ptr()) == 1 }
+    pub fn is_playing() -> bool {
+        unsafe { avplayer_is_playing() != 0 }
+    }
+    pub fn current_time() -> f64 {
+        unsafe { avplayer_current_time() }
+    }
+    pub fn duration() -> f64 {
+        unsafe { avplayer_duration() }
+    }
+    pub fn did_finish() -> bool {
+        unsafe { avplayer_did_finish() != 0 }
+    }
+    pub fn seek(seconds: f64) {
+        unsafe { avplayer_seek(seconds) }
+    }
+    pub fn toggle_fullscreen() {
+        unsafe { avplayer_toggle_fullscreen() }
+    }
+    pub fn is_fullscreen() -> bool {
+        unsafe { avplayer_is_fullscreen() != 0 }
+    }
+    pub fn set_file_label(text: &str) {
+        let s = c_str(text).unwrap_or_default();
+        unsafe { avplayer_set_file_label(s.as_ptr()) }
+    }
+    pub fn pump_once() {
+        unsafe { avplayer_pump_once() }
+    }
+    pub fn poll_key() -> i32 {
+        unsafe { avplayer_poll_key() }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-mod window_native {
-    pub fn set_aspect_ratio(_title: &str, _width: f64, _height: f64) -> bool {
+mod avplayer {
+    pub fn init() {}
+    pub fn destroy() {}
+    pub fn load(_path: &str) {}
+    pub fn play() {}
+    pub fn pause() {}
+    pub fn is_playing() -> bool {
         false
     }
-    pub fn clear_aspect_ratio(_title: &str) -> bool {
+    pub fn current_time() -> f64 {
+        0.0
+    }
+    pub fn duration() -> f64 {
+        0.0
+    }
+    pub fn did_finish() -> bool {
         false
     }
-    pub fn get_content_size(_title: &str) -> Option<(i32, i32)> {
-        None
-    }
-    pub fn set_standard_decorations(_title: &str) -> bool {
+    pub fn seek(_secs: f64) {}
+    pub fn toggle_fullscreen() {}
+    pub fn is_fullscreen() -> bool {
         false
     }
-    pub fn toggle_fullscreen(_title: &str) -> bool {
-        false
-    }
-    pub fn is_fullscreen(_title: &str) -> bool {
-        false
+    pub fn set_file_label(_text: &str) {}
+    pub fn pump_once() {}
+    pub fn poll_key() -> i32 {
+        -1
     }
 }
-
-const PLAYER_ASPECT_W: f64 = 16.0;
-const PLAYER_ASPECT_H: f64 = 9.0;
 
 const KEY_Q: i32 = 'q' as i32;
 const KEY_N: i32 = 'n' as i32;
@@ -602,16 +602,13 @@ const KEY_QMARK: i32 = '?' as i32;
 const KEY_ESCAPE: i32 = 27;
 const KEY_SPACE: i32 = 32;
 const KEY_LEFT1: i32 = 81;
-const KEY_LEFT2: i32 = 2424832;
 const KEY_RIGHT1: i32 = 83;
-const KEY_RIGHT2: i32 = 2555904;
 const KEY_UP1: i32 = 82;
-const KEY_UP2: i32 = 2490368;
 const KEY_DOWN1: i32 = 84;
-const KEY_DOWN2: i32 = 2621440;
 
 pub fn run_normal(min_dur: f64) {
-    println!("rpick interactive mode — video file manager");
+    println!("rpick interactive mode — native video player");
+    println!("(AVPlayer-backed — hardware accelerated)");
 
     let video_files = match filesystem::scan_videos(".") {
         Ok(f) => f,
@@ -689,573 +686,187 @@ pub fn run_normal(min_dur: f64) {
         }
     );
 
-    // Load deleted hashes
     let mut deleted_hashes = load_deleted_hashes();
 
-    // Create window
-    let window_name = "rpick";
-    if let Err(e) = highgui::named_window(window_name, WINDOW_NORMAL) {
-        eprintln!("Failed to create window: {}", e);
-        return;
-    }
-    // Set a sensible default 16:9 player frame (matches gopick's default)
-    let _ = highgui::resize_window(window_name, 960, 540);
+    // Create the native AVPlayer window (must be called from the main thread)
+    avplayer::init();
 
-    // Show an initial frame so the native Cocoa NSWindow exists before configuring it.
-    if let Ok(init_frame) =
-        Mat::new_rows_cols_with_default(540, 960, CV_8UC3, Scalar::new(30.0, 30.0, 30.0, 0.0))
-    {
-        let _ = highgui::imshow(window_name, &init_frame);
-        let _ = highgui::wait_key(1);
-    }
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    for _ in 0..10 {
-        if window_native::set_standard_decorations(window_name) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    for _ in 0..10 {
-        if window_native::set_aspect_ratio(window_name, PLAYER_ASPECT_W, PLAYER_ASPECT_H) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-
-    let mut i = 0usize;
-    let mut paused = false;
+    let mut i: isize = 0;
     let mut quit_all = false;
 
-    while i < filtered.len() {
-        let vf = &filtered[i];
-        println!("Playing ({}/{}) {}", i + 1, filtered.len(), vf.path);
+    'outer: while (i as usize) < filtered.len() {
+        let idx = i as usize;
+        let vf = &filtered[idx];
+        println!("Playing ({}/{}) {}", idx + 1, filtered.len(), vf.path);
 
-        // Open video file
-        let mut cap = match VideoCapture::from_file_def(vf.path.as_str()) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("  Error opening: {}", e);
-                i += 1;
-                continue;
-            }
-        };
+        avplayer::set_file_label(&format!(
+            "File {}/{}  {}",
+            idx + 1,
+            filtered.len(),
+            vf.path
+        ));
+        avplayer::load(&vf.path);
 
-        let fps = cap.get(CAP_PROP_FPS).unwrap_or(30.0);
-        let frame_count = cap.get(CAP_PROP_FRAME_COUNT).unwrap_or(0.0);
-        let duration_secs = if fps > 0.0 {
-            frame_count / fps
-        } else {
-            vf.duration
-        };
+        // Give AVPlayer a moment to start
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let mut frame = Mat::default();
-        let mut help_visible = false;
-        let mut seek_target: Option<f64> = None;
-        let mut current_pos: f64 = 0.0;
+        'inner: loop {
+            // Pump the Cocoa run loop so AVPlayer renders and controls respond
+            avplayer::pump_once();
 
-        // Frame timing: compute delay per frame based on FPS
-        let frame_delay_ms = if fps > 0.0 { (1000.0 / fps) as i32 } else { 33 };
-
-        // Main playback loop
-        loop {
-            let frame_start = std::time::Instant::now();
-
-            // Handle pending seek
-            if let Some(target) = seek_target.take() {
-                let ms = (target * 1000.0) as f64;
-                let _ = cap.set(CAP_PROP_POS_MSEC, ms);
-            }
-
-            if !paused {
-                match cap.read(&mut frame) {
-                    Ok(true) => {}
-                    _ => {
-                        break;
-                    }
+            // Process all pending key events
+            let dur = avplayer::duration();
+            loop {
+                let key = avplayer::poll_key();
+                if key == -1 {
+                    break; // no more keys
                 }
-                // Track current position from the frame
-                current_pos = cap.get(CAP_PROP_POS_MSEC).unwrap_or(0.0) / 1000.0;
-            }
 
-            if frame.empty() {
-                // No frame available yet
-                let key = highgui::wait_key(15).unwrap_or(-1);
-                if key != -1 {
-                    let brk = handle_key(
-                        key,
-                        vf,
-                        &mut i,
-                        &mut paused,
-                        &mut help_visible,
-                        duration_secs,
-                        &mut seek_target,
-                        &mut current_pos,
-                        filtered.len(),
-                        &mut deleted_hashes,
-                        &mut quit_all,
-                    );
-                    if brk {
-                        break;
+                match key {
+                    // ── Quit ────────────────────────────────────
+                    KEY_Q => {
+                        println!("Quit");
+                        quit_all = true;
+                        break 'inner;
                     }
+                    KEY_ESCAPE => {
+                        if avplayer::is_fullscreen() {
+                            println!("  Restored window");
+                            avplayer::toggle_fullscreen();
+                        }
+                    }
+
+                    // ── Navigation ──────────────────────────────
+                    KEY_N | KEY_A | KEY_DOWN1 => {
+                        break 'inner; // next video
+                    }
+                    KEY_UP1 => {
+                        if i > 0 {
+                            i -= 1;
+                        }
+                        break 'inner; // prev video
+                    }
+
+                    // ── File operations ─────────────────────────
+                    KEY_G => {
+                        move_file(vf, "../Good");
+                        break 'inner;
+                    }
+                    KEY_F => {
+                        move_file(vf, "../Fine");
+                        break 'inner;
+                    }
+                    KEY_D => {
+                        match filesystem::send_to_trash(&vf.path) {
+                            Ok(_) => {
+                                println!("  Trashed: {}", vf.path);
+                                if let Some(hash) = compute_file_hash(&vf.path) {
+                                    deleted_hashes.insert(hash);
+                                }
+                            }
+                            Err(e) => eprintln!("  Trash failed: {} ({})", vf.path, e),
+                        }
+                        break 'inner;
+                    }
+                    KEY_O => {
+                        println!("  Opening in Finder: {}", vf.path);
+                        let _ = Command::new("open").arg("-R").arg(&vf.path).output();
+                    }
+                    KEY_W => {
+                        println!("  Adding Purple tag to: {}", vf.path);
+                        let _ = filesystem::set_tag(&vf.path, "Purple");
+                    }
+                    KEY_U | KEY_Z => {
+                        println!("  Undo: not implemented");
+                    }
+
+                    // ── Playback ────────────────────────────────
+                    KEY_SPACE => {
+                        if avplayer::is_playing() {
+                            println!("  Paused");
+                            avplayer::pause();
+                        } else {
+                            println!("  Playing");
+                            avplayer::play();
+                        }
+                    }
+                    KEY_LEFT1 | KEY_C => {
+                        let cur = avplayer::current_time();
+                        let t = (cur - 30.0).max(0.0);
+                        avplayer::seek(t);
+                    }
+                    KEY_RIGHT1 | KEY_V => {
+                        let cur = avplayer::current_time();
+                        let t = (cur + 30.0).min(dur);
+                        avplayer::seek(t);
+                    }
+                    KEY_E => {
+                        let t = dur * 0.95;
+                        avplayer::seek(t);
+                    }
+                    KEY_FULLSCREEN => {
+                        avplayer::toggle_fullscreen();
+                    }
+
+                    // ── OCR ─────────────────────────────────────
+                    KEY_T => {
+                        let ocr_results = extract_ocr_from_video(&vf.path);
+                        match ocr_results {
+                            Ok(results) => {
+                                if results.is_empty() {
+                                    println!("  OCR: (no text found)");
+                                } else {
+                                    println!("  OCR -> {}:", vf.path);
+                                    for r in &results {
+                                        println!(
+                                            "    \"{}\" (conf {:.1})",
+                                            r.text, r.confidence
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!("  OCR warning: {}", e),
+                        }
+                    }
+
+                    _ => {} // unknown key, ignore
                 }
-                continue;
+
+                // After a file-move key (g/f/d) the video should advance
+                // and also after n/a/down. Breaking inner loop handles that.
+                // But we also need to check quit after the inner match.
+                if quit_all {
+                    break 'inner;
+                }
             }
 
-            // Center the frame into a canvas matching the window size (letter-boxed)
-            // so the video is always centered with symmetric black bars
-            let mut canvas = center_frame_in_window(&frame, window_name);
-
-            // Draw overlays on the canvas with current position
-            let current_mins = (current_pos / 60.0) as i32;
-            let current_secs = (current_pos % 60.0) as i32;
-            draw_ui_overlays(
-                &mut canvas,
-                vf,
-                i,
-                filtered.len(),
-                duration_secs,
-                fps,
-                current_mins,
-                current_secs,
-                help_visible,
-            );
-
-            // Show canvas
-            let _ = highgui::imshow(window_name, &canvas);
-
-            // Wait for key — use frame-rate-aware delay so playback is not too fast
-            // Measure elapsed time since frame_start and only wait the remaining portion
-            let elapsed_ms = frame_start.elapsed().as_millis() as i32;
-            let wait_ms = if elapsed_ms < frame_delay_ms {
-                (frame_delay_ms - elapsed_ms).max(1)
-            } else {
-                1 // Already took longer than frame delay; minimal wait
-            };
-            let key = highgui::wait_key(wait_ms).unwrap_or(-1);
-
-            // If help is visible, any key dismisses except '?'
-            if help_visible && key != KEY_QMARK && key != -1 {
-                help_visible = false;
-                continue;
+            // Check for quit (set by KEY_Q)
+            if quit_all {
+                break 'inner;
             }
 
-            let brk = handle_key(
-                key,
-                vf,
-                &mut i,
-                &mut paused,
-                &mut help_visible,
-                duration_secs,
-                &mut seek_target,
-                &mut current_pos,
-                filtered.len(),
-                &mut deleted_hashes,
-                &mut quit_all,
-            );
-            if brk {
-                break;
+            // Auto-advance when video plays to the end
+            if avplayer::did_finish() {
+                break 'inner;
             }
-
-            // If paused, we don't read the next frame; just keep displaying the current one
-            // The wait_key above already provides the delay
         }
-
-        let _ = cap.release();
 
         if quit_all {
-            break;
+            break 'outer;
         }
+
+        // Advance to next video (skip is already handled by break 'inner)
         i += 1;
     }
 
-    let _ = highgui::destroy_all_windows();
+    avplayer::destroy();
     save_deleted_hashes(&deleted_hashes);
     println!("Done.");
-}
-
-/// Returns true if the caller should break out of the current video loop (next/quit)
-fn normalize_key(key: i32) -> i32 {
-    match key {
-        // Preserve extended arrow-key codes before low-byte normalization.
-        KEY_LEFT1 | KEY_LEFT2 | KEY_RIGHT1 | KEY_RIGHT2 | KEY_UP1 | KEY_UP2 | KEY_DOWN1
-        | KEY_DOWN2 => key,
-        // Some HighGUI backends include modifier/high bits with printable keys.
-        // Keep ASCII semantics so lowercase f (Fine) and uppercase F (fullscreen)
-        // stay distinct when the low byte is correct.
-        k if k > 255 => k & 0xff,
-        k => k,
-    }
-}
-
-fn handle_key(
-    key: i32,
-    vf: &VideoFile,
-    i: &mut usize,
-    paused: &mut bool,
-    help_visible: &mut bool,
-    duration_secs: f64,
-    seek_target: &mut Option<f64>,
-    current_pos: &mut f64,
-    _total: usize,
-    deleted_hashes: &mut DeletedHashes,
-    quit_all: &mut bool,
-) -> bool {
-    if key == -1 {
-        return false;
-    }
-    let key = normalize_key(key);
-
-    match key {
-        KEY_Q => {
-            // q -> quit entirely
-            println!("Quit");
-            *quit_all = true;
-            return true;
-        }
-        KEY_ESCAPE => {
-            // Escape -> restore window if fullscreen
-            if window_native::is_fullscreen("rpick") {
-                println!("  Restored window");
-                let _ = window_native::toggle_fullscreen("rpick");
-                let _ = window_native::set_aspect_ratio("rpick", PLAYER_ASPECT_W, PLAYER_ASPECT_H);
-            }
-            return false;
-        }
-        KEY_N | KEY_A => {
-            // n or a -> next
-            return true;
-        }
-        KEY_G => {
-            move_file(vf, "../Good");
-            return true;
-        }
-        KEY_F => {
-            move_file(vf, "../Fine");
-            return true;
-        }
-        KEY_D => {
-            match filesystem::send_to_trash(&vf.path) {
-                Ok(_) => {
-                    println!("  Trashed: {}", vf.path);
-                    // Record hash in deleted hashes
-                    if let Some(hash) = compute_file_hash(&vf.path) {
-                        deleted_hashes.insert(hash);
-                    }
-                }
-                Err(e) => eprintln!("  Trash failed: {} ({})", vf.path, e),
-            }
-            return true;
-        }
-        KEY_O => {
-            println!("  Opening in Finder: {}", vf.path);
-            let _ = Command::new("open").arg("-R").arg(&vf.path).output();
-            return true;
-        }
-        KEY_E => {
-            // Jump near the end (95% of video duration)
-            let target = duration_secs * 0.95;
-            *seek_target = Some(target);
-            *current_pos = target;
-            return false;
-        }
-        KEY_T => {
-            // OCR on current frame — extract frame via ffmpeg
-            let ocr_results = extract_ocr_from_video(&vf.path);
-            match ocr_results {
-                Ok(results) => {
-                    if results.is_empty() {
-                        println!("  OCR: (no text found)");
-                    } else {
-                        println!("  OCR -> {}:", vf.path);
-                        for r in &results {
-                            println!("    \"{}\" (conf {:.1})", r.text, r.confidence);
-                        }
-                    }
-                }
-                Err(e) => eprintln!("  OCR warning: {}", e),
-            }
-            return false;
-        }
-        KEY_W => {
-            println!("  Adding Purple tag to: {}", vf.path);
-            let _ = filesystem::set_tag(&vf.path, "Purple");
-            return false;
-        }
-        KEY_U | KEY_Z => {
-            println!("  Undo: not implemented");
-            return false;
-        }
-        KEY_QMARK => {
-            *help_visible = !*help_visible;
-            return false;
-        }
-        KEY_SPACE => {
-            // Space -> play/pause
-            *paused = !*paused;
-            if *paused {
-                println!("  Paused");
-            } else {
-                println!("  Playing");
-            }
-            return false;
-        }
-        KEY_LEFT1 | KEY_LEFT2 | KEY_C => {
-            // Left arrow -> seek -30s
-            let new_pos = (*current_pos - 30.0).max(0.0);
-            *seek_target = Some(new_pos);
-            *current_pos = new_pos;
-            return false;
-        }
-        KEY_RIGHT1 | KEY_RIGHT2 | KEY_V => {
-            // Right arrow -> seek +30s
-            let new_pos = (*current_pos + 30.0).min(duration_secs);
-            *seek_target = Some(new_pos);
-            *current_pos = new_pos;
-            return false;
-        }
-        KEY_FULLSCREEN => {
-            // Uppercase F -> fullscreen toggle
-            if window_native::is_fullscreen("rpick") {
-                println!("  Restored window");
-                let _ = window_native::toggle_fullscreen("rpick");
-                let _ = window_native::set_aspect_ratio("rpick", PLAYER_ASPECT_W, PLAYER_ASPECT_H);
-            } else {
-                println!("  Maximizing to fullscreen");
-                let _ = window_native::clear_aspect_ratio("rpick");
-                let _ = window_native::toggle_fullscreen("rpick");
-            }
-            return false;
-        }
-        KEY_UP1 | KEY_UP2 => {
-            // Up arrow -> previous video
-            if *i > 0 {
-                *i -= 1;
-            }
-            return true;
-        }
-        KEY_DOWN1 | KEY_DOWN2 => {
-            // Down arrow -> next video
-            return true;
-        }
-        _ => {
-            // unknown key, ignore
-            return false;
-        }
-    }
 }
 
 fn move_file(vf: &VideoFile, dest: &str) {
     match filesystem::move_to_folder(&vf.path, dest) {
         Ok(dest_path) => println!("  Moved: {} -> {}", vf.path, dest_path),
         Err(e) => eprintln!("  Move failed: {} ({})", vf.path, e),
-    }
-}
-
-/// Create a centered, letter-boxed frame matching the window's content area.
-/// Prevents OpenCV from anchoring the video to the top-left corner and ensures
-/// symmetric black bars when the window aspect ratio differs from the video's.
-/// Matches gopick's centerFrameInWindow behavior.
-fn center_frame_in_window(frame: &Mat, window_name: &str) -> Mat {
-    let frame_w = frame.cols();
-    let frame_h = frame.rows();
-    if frame_w == 0 || frame_h == 0 {
-        return Mat::default();
-    }
-
-    // Get the actual native Cocoa content area dimensions. OpenCV's
-    // get_window_image_rect can be stale on macOS during live resize/fullscreen.
-    let (target_w, target_h) = window_native::get_content_size(window_name)
-        .or_else(|| {
-            highgui::get_window_image_rect(window_name)
-                .ok()
-                .map(|r| (r.width, r.height))
-        })
-        .filter(|(w, h)| *w > 0 && *h > 0)
-        .unwrap_or((frame_w, frame_h));
-
-    // Scale preserving aspect ratio (fit within the window area)
-    let scale_x = target_w as f64 / frame_w as f64;
-    let scale_y = target_h as f64 / frame_h as f64;
-    let scale = scale_x.min(scale_y);
-    let new_w = ((frame_w as f64) * scale).round() as i32;
-    let new_h = ((frame_h as f64) * scale).round() as i32;
-
-    // Clamp to the target so borders are never negative
-    let new_w = new_w.min(target_w).max(1);
-    let new_h = new_h.min(target_h).max(1);
-
-    // Resize the video frame preserving aspect ratio
-    let mut resized = Mat::default();
-    if resize_def(frame, &mut resized, Size::new(new_w, new_h)).is_err() {
-        return frame.clone(); // fallback: show original frame
-    }
-
-    // If the resized frame already fills the window, no borders needed
-    if new_w == target_w && new_h == target_h {
-        return resized;
-    }
-
-    // Add centered black borders to match the window dimensions exactly
-    let top = (target_h - new_h) / 2;
-    let bottom = target_h - new_h - top;
-    let left = (target_w - new_w) / 2;
-    let right = target_w - new_w - left;
-
-    let mut canvas = Mat::default();
-    if copy_make_border_def(
-        &resized,
-        &mut canvas,
-        top,
-        bottom,
-        left,
-        right,
-        BORDER_CONSTANT,
-    )
-    .is_err()
-    {
-        return resized;
-    }
-    canvas
-}
-
-fn draw_ui_overlays(
-    frame: &mut Mat,
-    _vf: &VideoFile,
-    index: usize,
-    total: usize,
-    duration_secs: f64,
-    _fps: f64,
-    current_mins: i32,
-    current_secs: i32,
-    help_visible: bool,
-) {
-    let width = frame.cols();
-    let height = frame.rows();
-    if width == 0 || height == 0 {
-        return;
-    }
-
-    let white = Scalar::new(255.0, 255.0, 255.0, 0.0);
-    let _yellow = Scalar::new(0.0, 255.0, 255.0, 0.0);
-    let progress_color = Scalar::new(97.0, 175.0, 239.0, 0.0); // Blue
-
-    // Time display at top-left
-    let time_text = format!("Time: {:02}:{:02}", current_mins, current_secs);
-    let _ = imgproc::put_text_def(
-        frame,
-        &time_text,
-        Point::new(10, 30),
-        FONT_HERSHEY_SIMPLEX,
-        0.6,
-        white,
-    );
-
-    // Duration display at top-right
-    let dur_mins = (duration_secs / 60.0) as i32;
-    let dur_secs = (duration_secs % 60.0) as i32;
-    let dur_text = format!("{:02}:{:02}", dur_mins, dur_secs);
-    let _ = imgproc::put_text_def(
-        frame,
-        &dur_text,
-        Point::new(width - 60, 30),
-        FONT_HERSHEY_SIMPLEX,
-        0.6,
-        white,
-    );
-
-    // File progress at bottom
-    let progress_text = format!("File {}/{}", index + 1, total);
-    let _ = imgproc::put_text_def(
-        frame,
-        &progress_text,
-        Point::new(10, height - 10),
-        FONT_HERSHEY_SIMPLEX,
-        0.5,
-        white,
-    );
-
-    // Progress bar at bottom — background + filled portion
-    let bar_y = height - 25;
-    let bar_width = width - 20;
-    // Background (dark gray)
-    let _ = imgproc::rectangle_def(
-        frame,
-        Rect::new(10, bar_y, bar_width, 5),
-        Scalar::new(40.0, 40.0, 40.0, 0.0),
-    );
-    // Filled portion (blue) — proportional to current_pos / duration
-    let progress = if duration_secs > 0.0 {
-        (current_mins as f64 * 60.0 + current_secs as f64) / duration_secs
-    } else {
-        0.0
-    };
-    let filled_width = ((progress * bar_width as f64) as i32).max(0).min(bar_width);
-    if filled_width > 0 {
-        let _ =
-            imgproc::rectangle_def(frame, Rect::new(10, bar_y, filled_width, 5), progress_color);
-    }
-
-    if help_visible {
-        draw_help_overlay(frame, width, height);
-    }
-}
-
-fn draw_help_overlay(frame: &mut Mat, width: i32, height: i32) {
-    let yellow = Scalar::new(0.0, 255.0, 255.0, 0.0);
-    let white = Scalar::new(255.0, 255.0, 255.0, 0.0);
-
-    // Semi-transparent overlay
-    let _ = imgproc::rectangle_def(
-        frame,
-        Rect::new(0, 0, width, height),
-        Scalar::new(0.0, 0.0, 0.0, 0.0),
-    );
-
-    let shortcuts = [
-        ("g", "Mark as Good"),
-        ("f", "Mark as Fine"),
-        ("d", "Delete (trash)"),
-        ("t", "OCR text detection"),
-        ("n", "Next video"),
-        ("u/z", "Undo last action"),
-        ("o", "Open in Finder"),
-        ("Space", "Play/Pause"),
-        ("←/→", "Seek -30s/+30s"),
-        ("e", "Jump to end (95%)"),
-        ("↑/↓", "Prev/Next"),
-        ("w", "Add Purple tag"),
-        ("?", "Help overlay"),
-        ("q", "Quit"),
-        ("Esc", "Restore window"),
-    ];
-
-    let _ = imgproc::put_text_def(
-        frame,
-        "KEYBOARD SHORTCUTS",
-        Point::new(width / 2 - 100, 40),
-        FONT_HERSHEY_SIMPLEX,
-        0.8,
-        yellow,
-    );
-
-    for (j, (key, desc)) in shortcuts.iter().enumerate() {
-        let y = 80 + (j as i32) * 25;
-        let _ = imgproc::put_text_def(
-            frame,
-            key,
-            Point::new(30, y),
-            FONT_HERSHEY_SIMPLEX,
-            0.5,
-            yellow,
-        );
-        let _ = imgproc::put_text_def(
-            frame,
-            desc,
-            Point::new(100, y),
-            FONT_HERSHEY_SIMPLEX,
-            0.5,
-            white,
-        );
     }
 }
